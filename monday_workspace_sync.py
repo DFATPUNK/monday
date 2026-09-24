@@ -624,12 +624,28 @@ def convert_item(ctx: Ctx, src_board: dict, item: dict):
                 relations[dst_col] = sorted(str(i) for i in ids)
             continue
         if ctype == "file":
-            raw = parse_json(cv.get("value")) or {}
-            for f in raw.get("files", []) if isinstance(raw, dict) else []:
+            raw = parse_json(cv.get("value"))
+
+            file_entries = raw.get("files") if isinstance(raw, dict) else []
+            if not isinstance(file_entries, list):
+                file_entries = []
+
+            for f in file_entries:
+                if not isinstance(f, dict):
+                    continue
+
                 if f.get("assetId"):
-                    files.append((dst_col, str(f["assetId"]), f.get("name") or "fichier"))
+                    files.append((
+                        dst_col,
+                        str(f["assetId"]),
+                        f.get("name") or "fichier",
+                    ))
                 elif f.get("fileType") == "LINK" or f.get("linkToFile"):
-                    ctx.warn_once(f"link:{cv['id']}", f"Colonne fichier '{cv['id']}' : liens externes (Drive/OneDrive…) non transférables")
+                    ctx.warn_once(
+                        f"link:{cv['id']}",
+                        f"Colonne fichier '{cv['id']}' : "
+                        "liens externes (Drive/OneDrive…) non transférables",
+                    )
             continue
         if not dst_col:
             continue
