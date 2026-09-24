@@ -1,0 +1,66 @@
+# Synchronisation monday.com : inetprocess-unit (prod) -> demos-inetprocess (recette)
+# Secrets à créer dans le dépôt : MONDAY_SRC_TOKEN, MONDAY_DST_TOKEN
+# Variable de dépôt (optionnelle) : SOURCE_WORKSPACE
+name: monday-sync
+
+on:
+  workflow_dispatch:            # lancement manuel (bouton GitHub ou appel API depuis Make)
+    inputs:
+      workspace:
+        description: "Nom exact du workspace source"
+        required: false
+      boards:
+        description: "Boards à synchroniser, séparés par des virgules (vide = tous)"
+        required: false
+      archive_missing:
+        description: "Archiver en recette les éléments supprimés en prod"
+        type: boolean
+        default: true
+  schedule:
+    # Cron en UTC : dimanche 22:00 UTC = lundi 00:00 à Paris en heure d'été (23:00 en hiver).
+    # Pour un minuit Paris exact toute l'année, planifier plutôt depuis Make (fuseau Europe/Paris).
+    - cron: "0 22 * * 0"
+
+concurrency:
+  group: monday-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Synchroniser
+        env:
+          MONDAY_SRC_TOKEN: ${{ secrets.MONDAY_SRC_TOKEN }}
+          MONDAY_DST_TOKEN: ${{ secrets.MONDAY_DST_TOKEN }}
+          WS: ${{ inputs.workspace || vars.SOURCE_WORKSPACE }}
+          BOARDS: ${{ inputs.boards }}
+          ARCHIVE: ${{ github.event_name == 'schedule' || inputs.archive_missing }}
+        run: |
+          ARGS=(--source-workspace "$WS" --report sync_report.json)
+          [ -n "$BOARDS" ] && ARGS+=(--boards "$BOARDS")
+          [ "$ARCHIVE" = "true" ] && ARGS+=(--archive-missing)
+          python monday_workspace_sync.py "${ARGS[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-report
+          path: sync_report.json
+      # Prévient Make (scénario O2) que les tables sont synchronisées -> lancement des workflows
+      - name: Notifier Make
+        if: always()
+        env:
+          MAKE_CALLBACK_URL: ${{ secrets.MAKE_CALLBACK_URL }}
+          WS: ${{ inputs.workspace || vars.SOURCE_WORKSPACE }}
+        run: |
+          [ -z "$MAKE_CALLBACK_URL" ] && exit 0
+          if [ -f sync_report.json ]; then REPORT=$(cat sync_report.json); else REPORT='{"status":"error"}'; fi
+          jq -n --arg run "$GITHUB_RUN_ID" --arg ws "$WS" --argjson report "$REPORT" \
+            '{run_id:$run, workspace:$ws, report:$report}' \
+          | curl -sS -X POST "$MAKE_CALLBACK_URL" -H "Content-Type: application/json" --data @-
