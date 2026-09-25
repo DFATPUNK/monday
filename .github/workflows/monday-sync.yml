@@ -1,14 +1,21 @@
-# Synchronisation monday.com : inetprocess-unit (prod) -> demos-inetprocess (recette)
+# Synchronisation monday.com : leongrosse10 (prod) -> recette-lg (recette)
 # Secrets à créer dans le dépôt : MONDAY_SRC_TOKEN, MONDAY_DST_TOKEN
-# Variable de dépôt (optionnelle) : SOURCE_WORKSPACE
+# Variables de dépôt (recommandées) : SOURCE_WORKSPACE (ID du workspace prod), TARGET_WORKSPACE_ID (ID du workspace recette existant)
 name: monday-sync
 
 on:
   workflow_dispatch:            # lancement manuel (bouton GitHub ou appel API depuis Make)
     inputs:
       workspace:
-        description: "Nom exact du workspace source"
+        description: "ID (recommandé) ou nom du workspace source en prod"
         required: false
+      target_workspace_id:
+        description: "ID du workspace EXISTANT en recette (vide = workspace du même nom, créé s'il n'existe pas)"
+        required: false
+      diagnose:
+        description: "Diagnostic seul : afficher ce que voit le script, sans rien écrire en recette"
+        type: boolean
+        default: false
       boards:
         description: "Boards à synchroniser, séparés par des virgules (vide = tous)"
         required: false
@@ -41,10 +48,14 @@ jobs:
           MONDAY_DST_TOKEN: ${{ secrets.MONDAY_DST_TOKEN }}
           WS: ${{ inputs.workspace || vars.SOURCE_WORKSPACE }}
           BOARDS: ${{ inputs.boards }}
+          TARGET_ID: ${{ inputs.target_workspace_id || vars.TARGET_WORKSPACE_ID }}
+          DIAGNOSE: ${{ inputs.diagnose }}
           ARCHIVE: ${{ github.event_name == 'schedule' || inputs.archive_missing }}
         run: |
           ARGS=(--source-workspace "$WS" --report sync_report.json)
           [ -n "$BOARDS" ] && ARGS+=(--boards "$BOARDS")
+          [ -n "$TARGET_ID" ] && ARGS+=(--target-workspace-id "$TARGET_ID")
+          [ "$DIAGNOSE" = "true" ] && ARGS+=(--diagnose)
           [ "$ARCHIVE" = "true" ] && ARGS+=(--archive-missing)
           python monday_workspace_sync.py "${ARGS[@]}"
       - uses: actions/upload-artifact@v4

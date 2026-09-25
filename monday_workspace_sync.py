@@ -24,11 +24,11 @@ Activités, auteurs et dates d'origine des éléments/updates.
 
 Usage
 -----
-  export MONDAY_SRC_TOKEN=...   # token API d'un admin de inetprocess-unit
-  export MONDAY_DST_TOKEN=...   # token API d'un admin de demos-inetprocess
+  export MONDAY_SRC_TOKEN=...   # token API d'un admin de leongrosse10
+  export MONDAY_DST_TOKEN=...   # token API d'un admin de recette-lg
   python monday_workspace_sync.py \
-      --source-workspace "Pôle Projets" \
-      [--target-workspace "Nom en recette"] [--boards "Services & Projets,Demandes Fonctionnelles"] \
+      --source-workspace "🚧 Pôles Construction / Rénovation & Patrimoine" \
+      [--target-workspace "Nom en recette"] [--boards "P1 - Affaires,P1 - Contacts"] \
       [--no-updates] [--no-files] [--archive-missing] [--report report.json]
 
 STATUT : prototype à valider d'abord sur un workspace cible jetable
@@ -333,6 +333,7 @@ class Ctx:
         self.src_boards: dict[str, dict] = {}
         self.tag_cache: dict[str, str] = {}
         self.warned: set[str] = set()
+        self.same_account = False  # source et cible sur le même compte monday (mode test)
         self.report = defaultdict(list)
         self.stats = defaultdict(int)
 
@@ -373,13 +374,33 @@ def fetch_board(api: Monday, board_id: str) -> dict:
     return b
 
 
+def norm(name: str) -> str:
+    """Normalise un nom pour les comparaisons (emojis, espaces insécables, casse)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", name or "").replace("️", "").replace(" ", " ")
+    return re.sub(r"\s+", " ", s).strip().casefold()
+
+
 def list_workspaces(api: Monday) -> list[dict]:
     return list(api.paged("query($page:Int,$limit:Int){ workspaces(limit:$limit, page:$page){ id name kind description } }", "workspaces"))
 
 
+def get_workspace(api: Monday, ws_id: str) -> dict | None:
+    rows = api.gql("query($ids:[ID!]){ workspaces(ids:$ids){ id name kind description } }", {"ids": [ws_id]}).get("workspaces") or []
+    return rows[0] if rows else None
+
+
+def find_workspace(api: Monday, ref: str) -> dict | None:
+    """Trouve un workspace par ID (chiffres) ou par nom normalisé."""
+    ref = (ref or "").strip()
+    if ref.isdigit():
+        return get_workspace(api, ref)
+    return next((w for w in list_workspaces(api) if norm(w["name"]) == norm(ref)), None)
+
+
 def list_boards(api: Monday, ws_id: str) -> list[dict]:
     q = "query($ws:[ID!],$page:Int,$limit:Int){ boards(workspace_ids:$ws, limit:$limit, page:$page, state:active){ id name type board_folder_id } }"
-    return [b for b in api.paged(q, "boards", {"ws": [ws_id]}) if b.get("type") in (None, "board")]
+    return [b for b in api.paged(q, "boards", {"ws": [ws_id]}) if b.get("type") not in ("sub_items_board", "document")]
 
 
 def list_folders(api: Monday, ws_id: str) -> list[dict]:
@@ -434,10 +455,12 @@ def build_people_maps(ctx: Ctx):
 
 
 def ensure_workspace(ctx: Ctx, src_ws: dict, target_name: str) -> str:
-    for ws in list_workspaces(ctx.dst):
-        if ws["name"].strip() == target_name.strip():
-            log.info("Workspace cible existant : %s (%s)", ws["name"], ws["id"])
-            return str(ws["id"])
+    existing = find_workspace(ctx.dst, target_name)
+    if existing:
+        log.info("Workspace cible existant : %s (%s)", existing["name"], existing["id"])
+        return str(existing["id"])
+    log.warning("Aucun workspace nommé « %s » en recette : il va être CRÉÉ. "
+                "Pour utiliser un workspace existant, passez --target-workspace-id <ID>.", target_name)
     product_id = None
     try:
         products = ctx.dst.gql("query{ account{ products{ id kind } } }")["account"]["products"] or []
@@ -560,7 +583,8 @@ def match_columns(ctx: Ctx, src_board: dict, dst_board: dict, late: bool, create
             if col["type"] in RELATION_TYPES | {"mirror", "lookup"}:
                 src_ids = [str(x) for x in (col["settings"].get("boardIds") or [])]
                 missing = [b for b in src_ids if b not in ctx.board_map]
-                if missing:
+                # Même compte : un board lié hors périmètre existe déjà côté cible, on garde son ID
+                if missing and not ctx.same_account:
                     ctx.report["columns_failed"].append(
                         f"{src_board['name']}/{col['title']}: board(s) lié(s) {missing} hors du périmètre synchronisé")
                     continue
@@ -572,8 +596,8 @@ def match_columns(ctx: Ctx, src_board: dict, dst_board: dict, late: bool, create
 
 
 def ensure_board(ctx: Ctx, src_board: dict, dst_ws: str, fmap: dict, dst_by_name: dict) -> tuple[dict, bool]:
-    if src_board["name"] in dst_by_name:
-        return fetch_board(ctx.dst, dst_by_name[src_board["name"]]), False
+    if norm(src_board["name"]) in dst_by_name:
+        return fetch_board(ctx.dst, dst_by_name[norm(src_board["name"])]), False
     v = {"n": src_board["name"], "k": src_board.get("board_kind") or "public", "w": dst_ws,
          "d": src_board.get("description") or None}
     sig, args = "$n:String!,$k:BoardKind!,$w:ID,$d:String", "board_name:$n, board_kind:$k, workspace_id:$w, description:$d, empty:true"
@@ -624,28 +648,12 @@ def convert_item(ctx: Ctx, src_board: dict, item: dict):
                 relations[dst_col] = sorted(str(i) for i in ids)
             continue
         if ctype == "file":
-            raw = parse_json(cv.get("value"))
-
-            file_entries = raw.get("files") if isinstance(raw, dict) else []
-            if not isinstance(file_entries, list):
-                file_entries = []
-
-            for f in file_entries:
-                if not isinstance(f, dict):
-                    continue
-
+            raw = parse_json(cv.get("value")) or {}
+            for f in raw.get("files", []) if isinstance(raw, dict) else []:
                 if f.get("assetId"):
-                    files.append((
-                        dst_col,
-                        str(f["assetId"]),
-                        f.get("name") or "fichier",
-                    ))
+                    files.append((dst_col, str(f["assetId"]), f.get("name") or "fichier"))
                 elif f.get("fileType") == "LINK" or f.get("linkToFile"):
-                    ctx.warn_once(
-                        f"link:{cv['id']}",
-                        f"Colonne fichier '{cv['id']}' : "
-                        "liens externes (Drive/OneDrive…) non transférables",
-                    )
+                    ctx.warn_once(f"link:{cv['id']}", f"Colonne fichier '{cv['id']}' : liens externes (Drive/OneDrive…) non transférables")
             continue
         if not dst_col:
             continue
@@ -840,7 +848,10 @@ def sync_relations(ctx: Ctx):
                 continue
             cv = {}
             for col, ids in relations.items():
-                mapped = [int(ctx.item_map[i]) for i in ids if i in ctx.item_map]
+                if ctx.same_account:  # élément hors périmètre : il existe dans le même compte, on garde son ID
+                    mapped = [int(ctx.item_map.get(i, i)) for i in ids]
+                else:
+                    mapped = [int(ctx.item_map[i]) for i in ids if i in ctx.item_map]
                 if len(mapped) < len(ids):
                     ctx.warn_once(f"rel:{sid}:{col}", f"{sb['name']} : certains éléments liés sont hors périmètre et ne sont pas reliés")
                 cv[col] = {"item_ids": mapped}
@@ -963,8 +974,11 @@ def archive_missing(ctx: Ctx):
 # --------------------------------------------------------------------------- #
 def main(argv=None):
     p = argparse.ArgumentParser(description="Réplique un workspace monday.com (prod -> recette)")
-    p.add_argument("--source-workspace", required=True, help="Nom exact ou ID du workspace source")
-    p.add_argument("--target-workspace", help="Nom du workspace cible (défaut : même nom)")
+    p.add_argument("--source-workspace", required=True, help="Nom ou ID (recommandé) du workspace source")
+    p.add_argument("--target-workspace", help="Nom du workspace cible (défaut : même nom ; créé s'il n'existe pas)")
+    p.add_argument("--target-workspace-id", help="ID d'un workspace EXISTANT en recette à utiliser comme cible")
+    p.add_argument("--diagnose", action="store_true",
+                   help="Affiche ce que le script voit (workspaces, boards) sans rien écrire en recette")
     p.add_argument("--boards", help="Liste de boards à synchroniser, séparés par des virgules (défaut : tous)")
     p.add_argument("--no-updates", action="store_true", help="Ne pas copier les updates")
     p.add_argument("--no-files", action="store_true", help="Ne pas copier les fichiers")
@@ -981,18 +995,56 @@ def main(argv=None):
     started = time.time()
     status = "error"
     try:
-        wss = list_workspaces(src)
-        src_ws = next((w for w in wss if str(w["id"]) == args.source_workspace or w["name"].strip() == args.source_workspace.strip()), None)
+        src_ws = find_workspace(src, args.source_workspace)
         if not src_ws:
-            sys.exit(f"Workspace source introuvable : {args.source_workspace}")
+            raise MondayError(f"Workspace source introuvable en prod : « {args.source_workspace} ». "
+                              "Utilisez son ID (URL …/workspaces/<ID>) et vérifiez que l'utilisateur du token en est membre.")
         log.info("Workspace source : %s (%s)", src_ws["name"], src_ws["id"])
-        build_people_maps(ctx)
-        dst_ws = ensure_workspace(ctx, src_ws, args.target_workspace or src_ws["name"])
-        fmap = ensure_folders(ctx, str(src_ws["id"]), dst_ws)
+        wanted = {norm(b) for b in args.boards.split(",")} if args.boards else None
+        all_src_boards = list_boards(src, str(src_ws["id"]))
+        src_list = [b for b in all_src_boards if not wanted or norm(b["name"]) in wanted]
+        log.info("Boards visibles en prod dans ce workspace : %d — retenus : %d (%s)", len(all_src_boards), len(src_list),
+                 ", ".join(b["name"] for b in src_list))
+        ctx.report["source"] = {"workspace": src_ws, "boards": [{"id": b["id"], "name": b["name"], "type": b.get("type")} for b in all_src_boards]}
+        if not src_list:
+            raise MondayError("Aucun board à synchroniser : le token prod ne voit aucun board de ce workspace "
+                              "(utilisateur non membre / boards privés) ou le filtre --boards ne correspond à aucun nom.")
 
-        wanted = {b.strip() for b in args.boards.split(",")} if args.boards else None
-        src_list = [b for b in list_boards(src, str(src_ws["id"])) if not wanted or b["name"] in wanted]
-        dst_by_name = {b["name"]: str(b["id"]) for b in list_boards(dst, dst_ws)}
+        if args.target_workspace_id:
+            tgt = get_workspace(dst, args.target_workspace_id)
+            if not tgt:
+                raise MondayError(f"Workspace cible {args.target_workspace_id} introuvable en recette (ou non accessible au token).")
+        else:
+            tgt = find_workspace(dst, args.target_workspace or src_ws["name"])
+        ctx.report["target"] = {"workspace": tgt or f"à créer : {args.target_workspace or src_ws['name']}"}
+
+        # Garde-fou : même compte et cible = source => le script écrirait dans le workspace source
+        try:
+            acc_src = src.gql("query{ account{ id slug } }")["account"]
+            acc_dst = dst.gql("query{ account{ id slug } }")["account"]
+            ctx.same_account = str(acc_src["id"]) == str(acc_dst["id"])
+        except MondayError as exc:
+            ctx.warn_once("account", f"Impossible de comparer les comptes source et cible : {exc}")
+        ctx.report["same_account"] = ctx.same_account
+        if ctx.same_account:
+            log.info("Source et cible sont sur le même compte (%s) : mode test intra-compte.", acc_src.get("slug"))
+        if tgt and str(tgt["id"]) == str(src_ws["id"]):
+            raise MondayError(
+                "La cible est le workspace SOURCE lui-même (même compte, même nom ou même ID). Le script refuse "
+                "d'écrire dedans. Indiquez le workspace cible avec --target-workspace-id <ID> (input GitHub "
+                "target_workspace_id) ou --target-workspace \"<autre nom>\".")
+        if args.diagnose:
+            log.info("DIAGNOSTIC — cible : %s", tgt or "aucun workspace correspondant, il serait CRÉÉ")
+            if tgt:
+                log.info("Boards déjà présents en recette : %s", ", ".join(b["name"] for b in list_boards(dst, str(tgt["id"]))) or "aucun")
+            status = "diagnose"
+            return
+
+        build_people_maps(ctx)
+        dst_ws = str(tgt["id"]) if tgt else ensure_workspace(ctx, src_ws, args.target_workspace or src_ws["name"])
+        log.info("Workspace cible utilisé : %s", dst_ws)
+        fmap = ensure_folders(ctx, str(src_ws["id"]), dst_ws)
+        dst_by_name = {norm(b["name"]): str(b["id"]) for b in list_boards(dst, dst_ws)}
 
         # Phase 1 : boards, groupes, colonnes simples
         pairs = []
@@ -1026,6 +1078,10 @@ def main(argv=None):
     except DailyLimitReached as exc:
         log.error("%s — relancez après minuit UTC, la synchro reprendra là où elle s'est arrêtée.", exc)
         status = "daily_limit"
+    except Exception as exc:
+        ctx.report["error"] = f"{type(exc).__name__}: {exc}"
+        log.error("ÉCHEC : %s", ctx.report["error"])
+        raise
     finally:
         ctx.report["status"] = status
         ctx.report["stats"] = dict(ctx.stats)
