@@ -734,35 +734,132 @@ def sync_rows(ctx: Ctx, src_board: dict, dst_board_id: str, rows: list[dict], ex
             creates.append((it, values, h))
     # Créations
     ops = []
-    for n, (it, values, h) in enumerate(creates):
+        # Exclude subitems whose parent was not synchronized.
+    eligible_creates = []
+
+    for it, values, h in creates:
+        if parent_map is not None:
+            parent_id = parent_map.get(str(it["id"]))
+            if not parent_id:
+                ctx.report["items_failed"].append(
+                    f"{src_board['name']} / {it['name']} ({it['id']}): "
+                    "parent non mappé dans la cible"
+                )
+                continue
+
+        eligible_creates.append((it, values, h))
+
+    # Créations
+    ops = []
+
+    for n, (it, values, h) in enumerate(eligible_creates):
         cv = dict(values, **{id_col: str(it["id"]), hash_col: h})
+
         if parent_map is None:
-            field = f"create_item(board_id:$b_{n}, item_name:$n_{n}, group_id:$g_{n}, column_values:$v_{n}, create_labels_if_missing:true){{ id }}"
-            v = {f"b_{n}": ("ID!", dst_board_id), f"n_{n}": ("String!", it["name"]),
-                 f"g_{n}": ("String", gmap.get((it.get("group") or {}).get("id"))), f"v_{n}": ("JSON", cv)}
+            field = (
+                f"create_item("
+                f"board_id:$b_{n}, "
+                f"item_name:$n_{n}, "
+                f"group_id:$g_{n}, "
+                f"column_values:$v_{n}, "
+                f"create_labels_if_missing:true"
+                f"){{ id }}"
+            )
+            v = {
+                f"b_{n}": ("ID!", dst_board_id),
+                f"n_{n}": ("String!", it["name"]),
+                f"g_{n}": (
+                    "String",
+                    gmap.get((it.get("group") or {}).get("id")),
+                ),
+                f"v_{n}": ("JSON", cv),
+            }
         else:
-            field = f"create_subitem(parent_item_id:$p_{n}, item_name:$n_{n}, column_values:$v_{n}, create_labels_if_missing:true){{ id }}"
-            v = {f"p_{n}": ("ID!", parent_map[str(it["id"])]), f"n_{n}": ("String!", it["name"]), f"v_{n}": ("JSON", cv)}
+            # Safe because eligible_creates was filtered above.
+            parent_id = parent_map[str(it["id"])]
+            field = (
+                f"create_subitem("
+                f"parent_item_id:$p_{n}, "
+                f"item_name:$n_{n}, "
+                f"column_values:$v_{n}, "
+                f"create_labels_if_missing:true"
+                f"){{ id }}"
+            )
+            v = {
+                f"p_{n}": ("ID!", parent_id),
+                f"n_{n}": ("String!", it["name"]),
+                f"v_{n}": ("JSON", cv),
+            }
+
         ops.append((f"c{n}", field, v))
+
     res = run_batched(ctx, ops)
-    for n, (it, values, h) in enumerate(creates):
+
+    # Use the same filtered list so cN remains aligned with the result.
+    for n, (it, values, h) in enumerate(eligible_creates):
         r = res.get(f"c{n}") or {}
-        if "__error__" in r:  # repli : création minimale puis colonnes une par une
+
+        if "__error__" in r:
+            # Retry with minimal creation, then write values individually.
             try:
                 if parent_map is None:
-                    r = ctx.dst.gql("mutation($b:ID!,$n:String!,$g:String,$v:JSON){ create_item(board_id:$b, item_name:$n, group_id:$g, column_values:$v){ id } }",
-                                    {"b": dst_board_id, "n": it["name"], "g": gmap.get((it.get("group") or {}).get("id")),
-                                     "v": {id_col: str(it["id"]), hash_col: h}})["create_item"]
+                    r = ctx.dst.gql(
+                        "mutation("
+                        "$b:ID!,"
+                        "$n:String!,"
+                        "$g:String,"
+                        "$v:JSON"
+                        "){ create_item("
+                        "board_id:$b, "
+                        "item_name:$n, "
+                        "group_id:$g, "
+                        "column_values:$v"
+                        "){ id } }",
+                        {
+                            "b": dst_board_id,
+                            "n": it["name"],
+                            "g": gmap.get((it.get("group") or {}).get("id")),
+                            "v": {
+                                id_col: str(it["id"]),
+                                hash_col: h,
+                            },
+                        },
+                    )["create_item"]
                 else:
-                    r = ctx.dst.gql("mutation($p:ID!,$n:String!,$v:JSON){ create_subitem(parent_item_id:$p, item_name:$n, column_values:$v){ id } }",
-                                    {"p": parent_map[str(it["id"])], "n": it["name"], "v": {id_col: str(it["id"]), hash_col: h}})["create_subitem"]
+                    parent_id = parent_map[str(it["id"])]
+                    r = ctx.dst.gql(
+                        "mutation("
+                        "$p:ID!,"
+                        "$n:String!,"
+                        "$v:JSON"
+                        "){ create_subitem("
+                        "parent_item_id:$p, "
+                        "item_name:$n, "
+                        "column_values:$v"
+                        "){ id } }",
+                        {
+                            "p": parent_id,
+                            "n": it["name"],
+                            "v": {
+                                id_col: str(it["id"]),
+                                hash_col: h,
+                            },
+                        },
+                    )["create_subitem"]
+
                 write_values_one_by_one(ctx, dst_board_id, r["id"], values)
+
             except MondayError as exc:
-                ctx.report["items_failed"].append(f"{src_board['name']} / {it['name']} ({it['id']}): {exc}")
+                ctx.report["items_failed"].append(
+                    f"{src_board['name']} / {it['name']} ({it['id']}): {exc}"
+                )
                 continue
+
         ctx.item_map[str(it["id"])] = str(r["id"])
         ctx.dirty_items.add(str(it["id"]))
-        ctx.stats["items_created" if parent_map is None else "subitems_created"] += 1
+        ctx.stats[
+            "items_created" if parent_map is None else "subitems_created"
+        ] += 1
     # Mises à jour
     ops = []
     for n, (it, values, h, ex) in enumerate(updates):
@@ -825,21 +922,66 @@ def sync_board_items(ctx: Ctx, src_board: dict, dst_board: dict, gmap: dict):
     src_sub["_items"] = [s for s, _ in subs]  # pour les phases relations / fichiers / updates
     ctx.src_boards[src_sub_id] = src_sub
     dst_sub_id = subitems_board_id(fetch_board(ctx.dst, did))
-    if not dst_sub_id:  # le board de sous-éléments n'existe qu'après le 1er sous-élément
-        s, parent = subs[0]
-        ctx.dst.gql("mutation($p:ID!,$n:String!){ create_subitem(parent_item_id:$p, item_name:$n){ id } }",
-                    {"p": ctx.item_map[str(parent["id"])], "n": "__init_sync__"})
+    if not dst_sub_id:
+        # Only use a parent that was actually synchronized to the target.
+        init_parent = next(
+            (
+                (subitem, parent)
+                for subitem, parent in subs
+                if ctx.item_map.get(str(parent["id"]))
+            ),
+            None,
+        )
+
+        if init_parent is None:
+            ctx.warn_once(
+                f"subitems-parent:{sid}",
+                f"{src_board['name']} : aucun parent de sous-élément "
+                "n'est mappé dans la cible ; sous-éléments ignorés",
+            )
+            return
+
+        _, parent = init_parent
+        ctx.dst.gql(
+            "mutation($p:ID!,$n:String!){ "
+            "create_subitem(parent_item_id:$p, item_name:$n){ id } }",
+            {
+                "p": ctx.item_map[str(parent["id"])],
+                "n": "__init_sync__",
+            },
+        )
+
         dst_sub_id = subitems_board_id(fetch_board(ctx.dst, did))
         if not dst_sub_id:
-            ctx.report["warnings"].append(f"{src_board['name']} : board de sous-éléments cible introuvable")
+            ctx.report["warnings"].append(
+                f"{src_board['name']} : board de sous-éléments cible introuvable"
+            )
             return
     ctx.board_map[src_sub_id] = dst_sub_id
     dst_sub = fetch_board(ctx.dst, dst_sub_id)
     match_columns(ctx, src_sub, dst_sub, late=False, created_board=False)
     ensure_sync_columns(ctx, fetch_board(ctx.dst, dst_sub_id))
     existing_sub = read_existing(ctx, dst_sub_id)
-    parent_map = {str(s["id"]): ctx.item_map.get(str(p["id"])) for s, p in subs}
-    rows = [s for s, p in subs if parent_map.get(str(s["id"]))]
+    parent_map = {
+        str(subitem["id"]): ctx.item_map.get(str(parent["id"]))
+        for subitem, parent in subs
+    }
+
+    rows = []
+    skipped = 0
+
+    for subitem, _ in subs:
+        if parent_map.get(str(subitem["id"])):
+            rows.append(subitem)
+        else:
+            skipped += 1
+
+    if skipped:
+        ctx.warn_once(
+            f"subitems-unmapped:{sid}",
+            f"{src_board['name']} : {skipped} sous-élément(s) ignoré(s) "
+            "car leur élément parent n'est pas mappé dans la cible",
+        )
     sync_rows(ctx, src_sub, dst_sub_id, rows, existing_sub, None, parent_map)
     # supprime le sous-élément technique d'initialisation
     for it in iter_items(ctx.dst, dst_sub_id, "id name"):
