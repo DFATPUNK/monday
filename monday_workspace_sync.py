@@ -741,17 +741,12 @@ def sync_rows(ctx: Ctx, src_board: dict, dst_board_id: str, rows: list[dict], ex
         if parent_map is not None:
             parent_id = parent_map.get(str(it["id"]))
             if not parent_id:
-                ctx.report["items_failed"].append(
-                    f"{src_board['name']} / {it['name']} ({it['id']}): "
-                    "parent non mappé dans la cible"
-                )
+                ctx.report["items_failed"].append(...)
                 continue
 
         eligible_creates.append((it, values, h))
 
     # Créations
-    ops = []
-
     for n, (it, values, h) in enumerate(eligible_creates):
         cv = dict(values, **{id_col: str(it["id"]), hash_col: h})
 
